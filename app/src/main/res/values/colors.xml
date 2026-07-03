@@ -1,0 +1,5 @@
+<resources>
+    <color name="wazak_background">#FFF8F0</color>
+    <color name="wazak_text">#231F20</color>
+    <color name="wazak_primary">#F06F5A</color>
+</resources>
