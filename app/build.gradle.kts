@@ -7,7 +7,7 @@ android {
     namespace = "ai.goyo.wazak"
     compileSdk = 36
 
-    val env = rootProject.file("../.env")
+    val env = rootProject.file(".env")
         .takeIf { it.exists() }
         ?.readLines()
         ?.mapNotNull { line ->

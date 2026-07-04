@@ -1,6 +1,5 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
@@ -26,9 +25,5 @@
                 <data android:scheme="wazak" android:host="auth" android:path="/callback" />
             </intent-filter>
         </activity>
-
-        <service
-            android:name=".FloatingMalangiService"
-            android:exported="false" />
     </application>
 </manifest>

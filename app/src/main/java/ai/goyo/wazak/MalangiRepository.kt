@@ -16,14 +16,6 @@ class MalangiRepository(private val context: Context) {
         get() = prefs.getInt(KEY_SELECTED_INDEX, 0)
         set(value) = prefs.edit().putInt(KEY_SELECTED_INDEX, value).apply()
 
-    var overlayX: Int
-        get() = prefs.getInt(KEY_OVERLAY_X, 80)
-        set(value) = prefs.edit().putInt(KEY_OVERLAY_X, value).apply()
-
-    var overlayY: Int
-        get() = prefs.getInt(KEY_OVERLAY_Y, 220)
-        set(value) = prefs.edit().putInt(KEY_OVERLAY_Y, value).apply()
-
     var authSession: AuthSession?
         get() = prefs.getString(KEY_AUTH_SESSION, null)?.let { AuthSession.fromJson(org.json.JSONObject(it)) }
         set(value) {
@@ -129,6 +121,33 @@ class MalangiRepository(private val context: Context) {
         ))
     }
 
+    fun addUploadedSounds(target: StoredMalangi, sounds: List<Pair<Uri, String>>) {
+        val dir = File(rootDir, target.localId).apply { mkdirs() }
+        val soundsDir = File(dir, "sounds").apply { mkdirs() }
+        val added = sounds.map { (uri, name) ->
+            val extension = name.substringAfterLast('.', "m4a").filter(Char::isLetterOrDigit).ifBlank { "m4a" }
+            val file = File(soundsDir, "upload-${UUID.randomUUID()}.$extension")
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                file.outputStream().use { output -> input.copyTo(output) }
+            }
+            file.absolutePath to name
+        }
+        saveLocal(target.copy(
+            soundPaths = target.soundPaths + added.map { it.first },
+            soundFileNames = target.soundFileNames + added.map { it.second }
+        ))
+    }
+
+    fun removeSound(target: StoredMalangi, path: String) {
+        val index = target.soundPaths.indexOf(path)
+        if (index < 0) return
+        if (isLocalReference(path)) File(path).delete()
+        saveLocal(target.copy(
+            soundPaths = target.soundPaths.filterIndexed { i, _ -> i != index },
+            soundFileNames = target.soundFileNames.filterIndexed { i, _ -> i != index }
+        ))
+    }
+
     fun setMarketplaceId(localId: String, marketplaceId: String?) {
         saveLocalList(localMalangis().map {
             if (it.localId == localId) it.copy(marketplaceId = marketplaceId) else it
@@ -154,8 +173,6 @@ class MalangiRepository(private val context: Context) {
         private const val KEY_LOCAL_MALANGIS = "localMalangis"
         private const val KEY_REMOTE_CATALOG = "remoteCatalog"
         private const val KEY_SELECTED_INDEX = "selectedIndex"
-        private const val KEY_OVERLAY_X = "overlayX"
-        private const val KEY_OVERLAY_Y = "overlayY"
         private const val KEY_AUTH_SESSION = "authSession"
 
         fun isLocalReference(path: String): Boolean = !path.startsWith("http://") && !path.startsWith("https://")

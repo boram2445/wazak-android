@@ -10,10 +10,12 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.provider.Settings
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.animation.OvershootInterpolator
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -28,21 +30,22 @@ class MainActivity : Activity() {
     private lateinit var repository: MalangiRepository
     private val supabase = SupabaseMalangiClient()
     private val recorder by lazy { AudioRecorder(this) }
-    private val player = SoundPlayer()
+    private val player by lazy { SoundPlayer(cacheDir) }
     private val handler = Handler(Looper.getMainLooper())
 
     private var mode = Mode.Home
     private var pendingPkce: Pkce? = null
     private var pendingImageUri: Uri? = null
-    private val pendingSounds = mutableListOf<Pair<Uri, String>>()
     private var marketplaceItems: List<MarketplaceMalangi> = emptyList()
+    private var accountExpanded = false
+    private var creatingNew = false
 
     private lateinit var root: FrameLayout
     private lateinit var homeImage: ImageView
     private lateinit var homeName: TextView
     private lateinit var statusText: TextView
     private lateinit var nameInput: EditText
-    private lateinit var soundListText: TextView
+    private lateinit var nicknameInput: EditText
     private lateinit var authText: TextView
 
     private val timerTick = object : Runnable {
@@ -76,7 +79,11 @@ class MainActivity : Activity() {
     }
 
     override fun onBackPressed() {
-        if (mode == Mode.Settings || mode == Mode.Marketplace) showHome() else super.onBackPressed()
+        when (mode) {
+            Mode.MalangiEdit -> showMalangiList()
+            Mode.MalangiList, Mode.Marketplace -> showHome()
+            else -> super.onBackPressed()
+        }
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -85,17 +92,22 @@ class MainActivity : Activity() {
         when (requestCode) {
             REQUEST_PICK_IMAGE -> {
                 pendingImageUri = data?.data
-                renderSettings()
+                renderMalangiEdit()
             }
             REQUEST_PICK_SOUND -> {
-                pendingSounds.clear()
+                val picked = mutableListOf<Pair<Uri, String>>()
                 data?.clipData?.let { clip ->
                     for (i in 0 until clip.itemCount) {
                         val uri = clip.getItemAt(i).uri
-                        pendingSounds += uri to displayName(uri.toString())
+                        picked += uri to displayName(uri.toString())
                     }
-                } ?: data?.data?.let { pendingSounds += it to displayName(it.toString()) }
-                renderSettings()
+                } ?: data?.data?.let { picked += it to displayName(it.toString()) }
+                val current = repository.selected()?.takeUnless { it.isDefault }
+                if (current != null && picked.isNotEmpty()) {
+                    repository.addUploadedSounds(current, picked)
+                    toast("사운드를 추가했어요")
+                }
+                renderMalangiEdit()
             }
         }
     }
@@ -109,11 +121,12 @@ class MainActivity : Activity() {
 
     private fun showHome() {
         mode = Mode.Home
+        creatingNew = false
         root.removeAllViews()
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(BACKGROUND)
-            setPadding(dp(28), dp(42), dp(28), dp(28))
+            setPadding(dp(28), dp(16), dp(28), dp(28))
         }
         root.addView(content, FrameLayout.LayoutParams(-1, -1))
 
@@ -126,7 +139,7 @@ class MainActivity : Activity() {
                 addView(homeTopButton(repository.authSession?.displayName ?: "계정") { refreshAccount() })
             }
             addView(homeTopButton("말랑이 마켓") { loadMarketplace() })
-            addView(homeTopButton("말랑이 관리") { showSettings() })
+            addView(homeTopButton("말랑이 관리") { showMalangiList() })
         }
         content.addView(topBar, LinearLayout.LayoutParams(-1, -2).apply {
             bottomMargin = dp(24)
@@ -150,10 +163,21 @@ class MainActivity : Activity() {
         homeImage = ImageView(this).apply {
             scaleType = ImageView.ScaleType.FIT_CENTER
             adjustViewBounds = true
-            setOnClickListener { playSelectedSound() }
+            setOnClickListener {
+                performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                playSelectedSound()
+            }
             setOnLongClickListener {
-                showSettings()
+                showMalangiList()
                 true
+            }
+            setOnTouchListener { v, event ->
+                when (event.action) {
+                    MotionEvent.ACTION_DOWN -> v.animate().scaleX(1.04f).scaleY(0.90f).setDuration(80).start()
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                        v.animate().scaleX(1f).scaleY(1f).setInterpolator(OvershootInterpolator()).setDuration(220).start()
+                }
+                false
             }
         }
         center.addView(homeImage, LinearLayout.LayoutParams(-1, dp(360)))
@@ -166,7 +190,7 @@ class MainActivity : Activity() {
             setPadding(0, dp(4), 0, 0)
             setOnClickListener { playSelectedSound() }
             setOnLongClickListener {
-                showSettings()
+                showMalangiList()
                 true
             }
         }
@@ -222,82 +246,341 @@ class MainActivity : Activity() {
         if (list.isEmpty()) return
         repository.selectedIndex = (repository.selectedIndex + delta + list.size) % list.size
         renderHome()
-        startService(Intent(this, FloatingMalangiService::class.java))
     }
 
-    private fun showSettings() {
-        mode = Mode.Settings
-        renderSettings()
+    private fun showMalangiList() {
+        mode = Mode.MalangiList
+        creatingNew = false
+        renderMalangiList()
     }
 
-    private fun renderSettings() {
+    private fun showMalangiEdit(index: Int?) {
+        pendingImageUri = null
+        if (index != null) {
+            repository.selectedIndex = index
+            creatingNew = false
+        } else {
+            creatingNew = true
+        }
+        mode = Mode.MalangiEdit
+        renderMalangiEdit()
+    }
+
+    private fun renderMalangiList() {
         root.removeAllViews()
         val scroll = ScrollView(this).apply { setBackgroundColor(BACKGROUND) }
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(72), dp(20), dp(36))
+            setPadding(dp(20), dp(24), dp(20), dp(36))
         }
         scroll.addView(content)
         root.addView(scroll, FrameLayout.LayoutParams(-1, -1))
 
-        val current = repository.selected()
         content.addView(topHeader("말랑이 관리"))
-        content.addView(section("말랑이 관리").apply {
+        content.addView(accountCard())
+        content.addView(malangiListCard())
+    }
+
+    private fun accountCard(): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(16), dp(18), if (accountExpanded) dp(18) else dp(16))
+            background = rounded(CARD, dp(20).toFloat(), colorWithAlpha(ACCENT_CORAL, 0x14), 1)
+            elevation = dp(2).toFloat()
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(14) }
+
+            addView(LinearLayout(context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setOnClickListener { accountExpanded = !accountExpanded; renderMalangiList() }
+                addView(sectionTitle("계정 · 백업"), LinearLayout.LayoutParams(0, -2, 1f))
+                addView(TextView(context).apply {
+                    text = if (accountExpanded) "▾" else "▸"
+                    textSize = 18f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(MUTED)
+                    gravity = Gravity.CENTER
+                }, LinearLayout.LayoutParams(dp(28), -2))
+            })
+
+            authText = smallText(accountSummary())
+            addView(authText)
+
+            if (accountExpanded) {
+                if (repository.authSession == null) {
+                    addView(styledButton("로그인", BtnStyle.Primary) { signInWithGoogle() })
+                } else {
+                    nicknameInput = EditText(context).apply {
+                        hint = "닉네임"
+                        setText(repository.authSession?.displayName.orEmpty())
+                        textSize = 15f
+                        setTextColor(TEXT)
+                        setHintTextColor(MUTED)
+                        background = rounded(SURFACE_SOFT, dp(14).toFloat(), colorWithAlpha(ACCENT_CORAL, 0x22), 1)
+                        setPadding(dp(14), dp(8), dp(14), dp(8))
+                    }
+                    addView(nicknameInput, LinearLayout.LayoutParams(-1, dp(48)).apply {
+                        topMargin = dp(8); bottomMargin = dp(4)
+                    })
+                    addView(styledButton("닉네임 저장", BtnStyle.Secondary) { updateNicknameFromInput() })
+                    addView(styledButton("세션 새로고침", BtnStyle.Secondary) { refreshAccount() })
+                    addView(styledButton("기본 말랑이 불러오기", BtnStyle.Secondary) { refreshRemoteLoudly() })
+                    addView(styledButton("내 백업 가져오기", BtnStyle.Secondary) { syncBackups() })
+                    addView(styledButton("마켓 목록 보기", BtnStyle.Secondary) { loadMarketplace() })
+                    addView(styledButton("로그아웃", BtnStyle.Danger) { repository.authSession = null; renderMalangiList() })
+                }
+            }
+        }
+
+    private fun malangiListCard(): LinearLayout =
+        section("내 말랑이").apply {
+            val list = repository.all()
+            if (list.isEmpty()) {
+                addView(smallText("아직 등록된 말랑이가 없어요. 새 말랑이를 추가해 주세요."))
+            } else {
+                val selectedIdx = repository.selectedIndex.coerceIn(0, list.lastIndex)
+                list.forEachIndexed { index, item ->
+                    addView(malangiListRow(item, index, !creatingNew && index == selectedIdx))
+                }
+            }
+            addView(styledButton("+ 새 말랑이 추가", BtnStyle.Ghost) { showMalangiEdit(null) })
+        }
+
+    private fun malangiListRow(item: StoredMalangi, index: Int, isSelected: Boolean): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = if (isSelected)
+                rounded(colorWithAlpha(ACCENT_PINK, 0x33), dp(16).toFloat(), colorWithAlpha(ACCENT_PINK, 0x88), 1)
+            else
+                rounded(SURFACE_SOFT, dp(16).toFloat())
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) }
+            setOnClickListener {
+                repository.selectedIndex = index
+                creatingNew = false
+                renderMalangiList()
+            }
+
             val preview = ImageView(context).apply {
                 scaleType = ImageView.ScaleType.CENTER_CROP
-                background = rounded(0x22F06F5A, dp(18).toFloat())
+                background = rounded(colorWithAlpha(ACCENT_CORAL, 0x22), dp(12).toFloat())
             }
-            addView(preview, LinearLayout.LayoutParams(-1, 380))
-            loadImage(preview, pendingImageUri?.toString() ?: current?.imagePath)
+            addView(preview, LinearLayout.LayoutParams(dp(56), dp(56)).apply { rightMargin = dp(12) })
+            loadImage(preview, item.imagePath)
 
+            addView(LinearLayout(context).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(TextView(context).apply {
+                    text = item.name
+                    textSize = 16f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(TEXT)
+                    maxLines = 1
+                })
+                addView(LinearLayout(context).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    addView(statusPill("사운드 ${item.soundPaths.size}개", MUTED))
+                    if (item.isDefault) {
+                        addView(statusPill("기본", MUTED), LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(6) })
+                    }
+                }, LinearLayout.LayoutParams(-2, -2).apply { topMargin = dp(4) })
+            }, LinearLayout.LayoutParams(0, -2, 1f).apply { rightMargin = dp(8) })
+
+            if (isSelected) {
+                addView(TextView(context).apply {
+                    text = "✓"
+                    textSize = 20f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(ACCENT_CORAL)
+                    gravity = Gravity.CENTER
+                }, LinearLayout.LayoutParams(dp(24), -2).apply { rightMargin = dp(4) })
+            }
+
+            addView(smallPill("수정", true) { showMalangiEdit(index) })
+        }
+
+    private fun renderMalangiEdit() {
+        root.removeAllViews()
+        val scroll = ScrollView(this).apply { setBackgroundColor(BACKGROUND) }
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(24), dp(20), dp(36))
+        }
+        scroll.addView(content)
+        root.addView(scroll, FrameLayout.LayoutParams(-1, -1))
+
+        val current = if (creatingNew) null else repository.selected()
+        val isNewDraft = creatingNew || current == null
+        val isEditable = current != null && !current.isDefault
+
+        content.addView(topHeader(if (isNewDraft) "새 말랑이" else "말랑이 편집") { showMalangiList() })
+
+        if (isNewDraft) {
+            content.addView(newMalangiBanner())
+        } else {
+            content.addView(malangiHero(current))
+        }
+
+        content.addView(section("기본 정보").apply {
             nameInput = EditText(context).apply {
                 hint = "말랑이 이름"
-                setText(current?.name.orEmpty())
+                setText(if (isNewDraft) "" else current?.name.orEmpty())
                 textSize = 16f
                 setTextColor(TEXT)
                 setHintTextColor(MUTED)
-                background = rounded(0xFFFFFBF7.toInt(), dp(14).toFloat(), 0x22F06F5A, 1)
+                background = rounded(SURFACE_SOFT, dp(14).toFloat(), colorWithAlpha(ACCENT_CORAL, 0x22), 1)
                 setPadding(dp(14), dp(8), dp(14), dp(8))
             }
             addView(nameInput, LinearLayout.LayoutParams(-1, dp(52)).apply { bottomMargin = dp(8) })
-            addView(button("말랑이 사진 등록") { pickImage() })
-            addView(button("사운드 여러 개 등록") { pickSounds() })
-            addView(button("현재 입력 저장") { saveDraft() })
-            addView(button("현재 말랑이 삭제") { repository.deleteCurrent(); pendingImageUri = null; pendingSounds.clear(); renderSettings() })
+            addView(styledButton("사진 변경", BtnStyle.Secondary) { pickImage() })
+            addView(styledButton("저장", BtnStyle.Primary) { saveDraft() })
         })
 
-        content.addView(section("등록된 사운드").apply {
-            soundListText = smallText(soundSummary(current))
-            addView(soundListText)
-            statusText = smallText("")
-            addView(statusText)
-            addView(button("녹음 시작 / 정지") { requestRecordingOrToggle() })
-            addView(button("미리듣기") {
-                repository.selected()?.soundPaths?.firstOrNull()?.let(player::play)
+        content.addView(section("사운드").apply {
+            when {
+                isNewDraft -> addView(smallText("사진과 이름을 먼저 저장하면 사운드를 추가할 수 있어요."))
+                !isEditable -> addView(smallText("기본 말랑이는 저장하면 내 말랑이로 복사돼요."))
+                else -> {
+                    if (current.soundPaths.isEmpty()) {
+                        addView(smallText("아직 등록된 사운드가 없어요."))
+                    } else {
+                        current.soundPaths.forEachIndexed { i, path ->
+                            addView(soundRow(current, path, current.soundFileNames.getOrElse(i) { "사운드 ${i + 1}" }))
+                        }
+                    }
+                    statusText = smallText("")
+                    addView(statusText)
+                    addView(styledButton(
+                        if (recorder.isRecording) "● 녹음 중지" else "● 녹음",
+                        if (recorder.isRecording) BtnStyle.Danger else BtnStyle.Secondary
+                    ) { requestRecordingOrToggle() })
+                    addView(styledButton("파일 올리기", BtnStyle.Secondary) { pickSounds() })
+                }
+            }
+        })
+
+        if (isEditable) {
+            content.addView(section("백업·공유").apply {
+                addView(styledButton("현재 말랑이 백업", BtnStyle.Secondary) { backupCurrent() })
+                addView(styledButton(
+                    current?.marketplaceId?.let { "마켓에서 내리기" } ?: "마켓에 올리기",
+                    if (current?.marketplaceId != null) BtnStyle.Danger else BtnStyle.Secondary
+                ) { toggleMarketplace() })
             })
-        })
 
-        content.addView(section("플로팅").apply {
-            addView(button("오버레이 권한 열기") { openOverlaySettings() })
-            addView(button("말랑이 시작") { startMalangi() })
-            addView(button("말랑이 숨기기") { stopService(Intent(this@MainActivity, FloatingMalangiService::class.java)) })
-        })
-
-        content.addView(section("Supabase").apply {
-            authText = smallText(accountSummary())
-            addView(authText)
-            addView(button("세션 새로고침") { refreshAccount() })
-            addView(button("닉네임 저장") { updateNicknameFromInput() })
-            addView(button("기본 말랑이 불러오기") { refreshRemoteLoudly() })
-            addView(button("내 백업 가져오기") { syncBackups() })
-            addView(button("현재 말랑이 백업") { backupCurrent() })
-            addView(button(current?.marketplaceId?.let { "마켓에서 내리기" } ?: "마켓에 올리기") { toggleMarketplace() })
-            addView(button("마켓 목록 보기") { loadMarketplace() })
-            addView(button("로그아웃") { repository.authSession = null; renderSettings() })
-        })
-
-        content.addView(button("홈으로") { pendingImageUri = null; pendingSounds.clear(); showHome() })
+            content.addView(styledButton("말랑이 삭제", BtnStyle.Danger) {
+                repository.deleteCurrent()
+                pendingImageUri = null
+                showMalangiList()
+            })
+        }
     }
+
+    private fun soundRow(current: StoredMalangi, path: String, name: String): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            background = rounded(SURFACE_SOFT, dp(14).toFloat())
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) }
+
+            addView(TextView(context).apply {
+                text = name
+                textSize = 14f
+                setTextColor(TEXT)
+                maxLines = 1
+            }, LinearLayout.LayoutParams(0, -2, 1f))
+
+            addView(TextView(context).apply {
+                text = "▶"
+                textSize = 18f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(ACCENT_CORAL)
+                gravity = Gravity.CENTER
+                setPadding(dp(10), dp(4), dp(10), dp(4))
+                setOnClickListener { player.play(path) }
+            }, LinearLayout.LayoutParams(dp(36), dp(36)))
+
+            addView(TextView(context).apply {
+                text = "✕"
+                textSize = 16f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(MUTED)
+                gravity = Gravity.CENTER
+                setPadding(dp(10), dp(4), dp(10), dp(4))
+                setOnClickListener {
+                    repository.removeSound(current, path)
+                    renderMalangiEdit()
+                }
+            }, LinearLayout.LayoutParams(dp(36), dp(36)).apply { leftMargin = dp(4) })
+        }
+
+    private fun newMalangiBanner(): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(18), dp(20), dp(18), dp(20))
+            background = rounded(CARD, dp(24).toFloat(), colorWithAlpha(ACCENT_CORAL, 0x1A), 1)
+            elevation = dp(4).toFloat()
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(16) }
+
+            val preview = ImageView(context).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                background = rounded(colorWithAlpha(ACCENT_CORAL, 0x22), dp(20).toFloat())
+            }
+            addView(preview, LinearLayout.LayoutParams(dp(140), dp(140)).apply { bottomMargin = dp(12) })
+            loadImage(preview, pendingImageUri?.toString())
+
+            addView(TextView(context).apply {
+                text = "새 말랑이 만들기"
+                textSize = 20f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(TEXT)
+                gravity = Gravity.CENTER
+            }, LinearLayout.LayoutParams(-2, -2).apply { bottomMargin = dp(6) })
+            addView(smallText("사진을 등록하고 이름을 입력한 뒤 저장해 주세요."))
+        }
+
+    private fun malangiHero(current: StoredMalangi?): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(dp(18), dp(20), dp(18), dp(20))
+            background = rounded(CARD, dp(24).toFloat(), colorWithAlpha(ACCENT_CORAL, 0x1A), 1)
+            elevation = dp(4).toFloat()
+            layoutParams = LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(16) }
+
+            val preview = ImageView(context).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                background = rounded(colorWithAlpha(ACCENT_CORAL, 0x22), dp(20).toFloat())
+            }
+            addView(preview, LinearLayout.LayoutParams(dp(140), dp(140)).apply { bottomMargin = dp(12) })
+            loadImage(preview, pendingImageUri?.toString() ?: current?.imagePath)
+
+            addView(TextView(context).apply {
+                text = current?.name?.takeIf { it.isNotBlank() } ?: "말랑이"
+                textSize = 22f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(TEXT)
+                gravity = Gravity.CENTER
+            }, LinearLayout.LayoutParams(-2, -2).apply { bottomMargin = dp(10) })
+
+            addView(
+                statusPill("사운드 ${current?.soundPaths?.size ?: 0}개", MUTED),
+                LinearLayout.LayoutParams(-2, -2).apply { bottomMargin = dp(4) }
+            )
+        }
+
+    private fun statusPill(text: String, color: Int): TextView =
+        TextView(this).apply {
+            this.text = text
+            textSize = 12f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(color)
+            setPadding(dp(10), dp(5), dp(10), dp(5))
+            background = rounded(colorWithAlpha(color, 0x22), dp(14).toFloat())
+        }
 
     private fun section(title: String): LinearLayout =
         LinearLayout(this).apply {
@@ -311,7 +594,7 @@ class MainActivity : Activity() {
             layoutParams = params
         }
 
-    private fun topHeader(text: String): LinearLayout =
+    private fun topHeader(text: String, onBack: () -> Unit = { showHome() }): LinearLayout =
         LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -322,7 +605,7 @@ class MainActivity : Activity() {
                 typeface = Typeface.DEFAULT_BOLD
                 gravity = Gravity.CENTER
                 setTextColor(MUTED)
-                setOnClickListener { showHome() }
+                setOnClickListener { onBack() }
             }, LinearLayout.LayoutParams(dp(48), dp(52)))
             addView(TextView(context).apply {
                 this.text = text
@@ -349,28 +632,39 @@ class MainActivity : Activity() {
             setPadding(0, dp(4), 0, dp(8))
         }
 
-    private fun button(text: String, action: () -> Unit): TextView =
+    private enum class BtnStyle { Primary, Secondary, Danger, Ghost }
+
+    private fun styledButton(text: String, style: BtnStyle, action: () -> Unit): TextView =
         TextView(this).apply {
             this.text = text
-            textSize = 15f
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
-            setTextColor(if (text.contains("삭제") || text.contains("로그아웃") || text.contains("내리기")) 0xFFD64545.toInt() else TEXT)
-            setPadding(dp(14), dp(10), dp(14), dp(10))
-            background = when {
-                text.contains("저장") || text.contains("로그인") || text.contains("시작") || text == "받기" ->
-                    rounded(ACCENT_PINK, dp(22).toFloat())
-                text.contains("삭제") || text.contains("로그아웃") || text.contains("내리기") ->
-                    rounded(0x14D64545, dp(22).toFloat(), 0x22D64545, 1)
-                else ->
-                    rounded(ACCENT_BLUE_SOFT, dp(22).toFloat(), 0x1A7EA4D8, 1)
-            }
-            if (text.contains("저장") || text.contains("로그인") || text.contains("시작") || text == "받기") {
-                setTextColor(0xFFFFFFFF.toInt())
+            textSize = 15f
+            val vPad = if (style == BtnStyle.Primary) dp(14) else dp(10)
+            setPadding(dp(14), vPad, dp(14), vPad)
+            when (style) {
+                BtnStyle.Primary -> {
+                    background = rounded(ACCENT_PINK, dp(24).toFloat())
+                    setTextColor(0xFFFFFFFF.toInt())
+                }
+                BtnStyle.Secondary -> {
+                    background = rounded(ACCENT_BLUE_SOFT, dp(22).toFloat(), 0x1A7EA4D8, 1)
+                    setTextColor(TEXT)
+                }
+                BtnStyle.Danger -> {
+                    background = rounded(0x14D64545, dp(22).toFloat(), 0x22D64545, 1)
+                    setTextColor(0xFFD64545.toInt())
+                }
+                BtnStyle.Ghost -> {
+                    background = null
+                    setTextColor(MUTED)
+                }
             }
             setOnClickListener { action() }
             layoutParams = LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) }
         }
+
+    private fun colorWithAlpha(color: Int, alpha: Int): Int = (alpha shl 24) or (color and 0x00FFFFFF)
 
     private fun pickImage() {
         startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
@@ -390,15 +684,15 @@ class MainActivity : Activity() {
     }
 
     private fun saveDraft() {
-        val existing = repository.selected()?.takeUnless { it.isDefault }
+        val existing = if (creatingNew) null else repository.selected()?.takeUnless { it.isDefault }
         if (pendingImageUri == null && existing == null) {
             toast("새 말랑이는 사진이 필요해요")
             return
         }
-        repository.createOrUpdate(existing, nameInput.text.toString(), pendingImageUri, pendingSounds.takeIf { it.isNotEmpty() })
+        repository.createOrUpdate(existing, nameInput.text.toString(), pendingImageUri, null)
         pendingImageUri = null
-        pendingSounds.clear()
-        renderSettings()
+        creatingNew = false
+        renderMalangiEdit()
     }
 
     private fun requestRecordingOrToggle() {
@@ -412,24 +706,12 @@ class MainActivity : Activity() {
             recorder.stop()
             repository.selected()?.takeUnless { it.isDefault }?.let { repository.addRecordedSound(it, file) }
             handler.removeCallbacks(timerTick)
-            renderSettings()
+            renderMalangiEdit()
         } else {
             recorder.start(File(filesDir, "last-recording.m4a"))
             handler.post(timerTick)
+            renderMalangiEdit()
         }
-    }
-
-    private fun openOverlaySettings() {
-        startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
-    }
-
-    private fun startMalangi() {
-        if (!Settings.canDrawOverlays(this)) {
-            openOverlaySettings()
-            toast("다른 앱 위에 표시 권한을 켜 주세요")
-            return
-        }
-        startService(Intent(this, FloatingMalangiService::class.java))
     }
 
     private fun signInWithGoogle() {
@@ -461,7 +743,7 @@ class MainActivity : Activity() {
 
     private fun updateNicknameFromInput() {
         val session = repository.authSession ?: return toast("로그인이 필요해요")
-        val nickname = nameInput.text.toString().trim()
+        val nickname = nicknameInput.text.toString().trim()
         if (nickname.isBlank()) return toast("닉네임으로 쓸 이름을 입력해 주세요")
         runAsync("닉네임 저장 완료") {
             repository.authSession = supabase.updateNickname(session, nickname)
@@ -535,7 +817,7 @@ class MainActivity : Activity() {
         val scroll = ScrollView(this).apply { setBackgroundColor(BACKGROUND) }
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(72), dp(20), dp(36))
+            setPadding(dp(20), dp(24), dp(20), dp(36))
         }
         scroll.addView(content)
         root.addView(scroll, FrameLayout.LayoutParams(-1, -1))
@@ -549,8 +831,6 @@ class MainActivity : Activity() {
                 content.addView(marketplaceRow(item))
             }
         }
-        content.addView(button("설정으로") { renderSettings() })
-        content.addView(button("홈으로") { showHome() })
     }
 
     private fun marketplaceRow(item: MarketplaceMalangi): LinearLayout =
@@ -632,7 +912,11 @@ class MainActivity : Activity() {
             runOnUiThread {
                 result.onSuccess { toast(doneMessage) }
                     .onFailure { toast(it.message ?: "실패했어요") }
-                if (mode == Mode.Settings) renderSettings() else renderHome()
+                when (mode) {
+                    Mode.MalangiList -> renderMalangiList()
+                    Mode.MalangiEdit -> renderMalangiEdit()
+                    else -> renderHome()
+                }
             }
         }.start()
     }
@@ -651,11 +935,6 @@ class MainActivity : Activity() {
         } else {
             view.setImageBitmap(BitmapFactory.decodeFile(reference))
         }
-    }
-
-    private fun soundSummary(current: StoredMalangi?): String {
-        val pending = if (pendingSounds.isEmpty()) "" else "\n선택됨: ${pendingSounds.size}개"
-        return (current?.soundFileNames?.joinToString("\n") ?: "사운드를 등록해 주세요") + pending
     }
 
     private fun accountSummary(): String {
@@ -687,7 +966,7 @@ class MainActivity : Activity() {
             }
         }
 
-    private enum class Mode { Home, Settings, Marketplace }
+    private enum class Mode { Home, MalangiList, MalangiEdit, Marketplace }
 
     companion object {
         private const val BACKGROUND = 0xFFFFF7ED.toInt()
@@ -696,6 +975,9 @@ class MainActivity : Activity() {
         private const val MUTED = 0xFF6F6460.toInt()
         private const val ACCENT_PINK = 0xFFFFB5C2.toInt()
         private const val ACCENT_BLUE_SOFT = 0x40A8C7EB
+        private const val ACCENT_CORAL = 0xFFF06F5A.toInt()
+        private const val SUCCESS = 0xFF3FA96A.toInt()
+        private const val SURFACE_SOFT = 0xFFFFFBF7.toInt()
         private const val REQUEST_PICK_IMAGE = 10
         private const val REQUEST_RECORD_AUDIO = 11
         private const val REQUEST_PICK_SOUND = 12
